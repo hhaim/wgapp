@@ -10,7 +10,7 @@ mkdir -p "$BUILD_PRODUCTS" "$PROJECT_ROOT/build/ModuleCache"
 BUILD_STAGE="$(mktemp -d "$BUILD_PRODUCTS/.wgapp-build.XXXXXX")"
 trap 'rm -rf "$BUILD_STAGE"' EXIT
 APP_STAGE="$BUILD_STAGE/WGApp.app"
-mkdir -p "$APP_STAGE/Contents/MacOS" "$APP_STAGE/Contents/Helpers"
+mkdir -p "$APP_STAGE/Contents/MacOS" "$APP_STAGE/Contents/Helpers" "$APP_STAGE/Contents/Resources"
 COMMON_ARGS=(
   -swift-version 5 -parse-as-library
   -target "$BUILD_ARCH-apple-macosx14.0" -sdk "$MACOS_SDK"
@@ -42,6 +42,8 @@ cp "$HELPER_CACHE/WGProfileHelper" "$APP_STAGE/Contents/Helpers/WGProfileHelper"
   -module-cache-path "$PROJECT_ROOT/build/ModuleCache" Sources/Shared/AppConstants.swift Sources/Shared/ProfileModels.swift Sources/WGApp/*.swift \
   -o "$APP_STAGE/Contents/MacOS/WGApp"
 cp Sources/WGApp/Info.plist "$APP_STAGE/Contents/Info.plist"
+python3 scripts/build-app-icon.py Sources/WGApp/Assets.xcassets/AppIcon.appiconset \
+  "$APP_STAGE/Contents/Resources/AppIcon.icns"
 /usr/bin/codesign --force --sign - --identifier com.example.wgapp.root-helper "$APP_STAGE/Contents/Helpers/WGRootHelper"
 /usr/bin/codesign --force --sign - "$APP_STAGE"
 /usr/bin/codesign --verify --deep --strict "$APP_STAGE"
