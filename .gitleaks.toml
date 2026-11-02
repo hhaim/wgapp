@@ -1,0 +1,11 @@
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Local deployment credentials and generated files excluded from publication"
+paths = [
+  '''(^|/)\.env$''',
+  '''(^|/)build/''',
+  '''(^|/)\.git/''',
+  '''(^|/)WGApp\.xcodeproj/''',
+]
