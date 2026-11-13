@@ -106,8 +106,11 @@ enum RootLauncherClient {
 
     static func up(_ request: RootUpRequest) async throws -> RootUpResult {
         try requireInstalled()
+        let capabilities = try await status(logicalName: request.logicalName)
+        guard capabilities.routeCleanupVersion == 1 else {
+            throw AppError.message("The installed root helper needs the route cleanup fix. Disconnect, then run ./b install to update it.")
+        }
         if request.proxy != nil {
-            let capabilities = try await status(logicalName: request.logicalName)
             guard capabilities.launcherVersion == 3 else {
                 throw AppError.message("The installed root helper does not support GOST proxy mode. Run ./b install to update it.")
             }

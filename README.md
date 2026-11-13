@@ -64,6 +64,86 @@ The app resolves the selected home endpoint, protects its physical-gateway route
 
 Disconnect restores DNS and removes the interface, routes and helper processes. Only one profile can be active. The profile row shows endpoint, interface, gateway, MTU, handshake age, uptime and traffic statistics.
 
+### Route preservation and cleanup verification
+
+WGApp checks routes before adding them. Existing routes never enter its cleanup list,
+including pre-existing endpoint routes with the same protocol flags as WGApp's routes.
+An exact AllowedIPs conflict (for example, the Wi-Fi LAN and tunnel both requesting
+`10.0.0.0/24`) fails connection and leaves the existing route intact. Broader or
+narrower tunnel prefixes can coexist with the LAN route. WGApp only adds routes;
+it does not change or replace pre-existing routes, so no displaced route needs
+restoration. Restoring a saved Wi-Fi route after the network changes could install
+an obsolete gateway or interface.
+
+Tunnel routes are released by tearing down the owned utun, with its logical name
+and interface index checked first. Cleanup never issues a subnet deletion for a
+tunnel route, even if the utun has already disappeared. Endpoint/relay host routes
+created by WGApp record their canonical prefix, interface name/index and gateway;
+cleanup checks those values and the `PROTO1`/`PROTO2` flags before deleting. Changed
+or unverifiable routes are retained. Completed route cleanup and interface teardown
+are consumed once, independently of DNS restoration retries. Startup rollback uses
+the same route handling. Both direct and proxy supervisors stop when the physical
+gateway or interface changes.
+
+Darwin's routing API does not provide an atomic compare-and-delete operation or a
+per-process route ownership identifier. Endpoint host-route verification and deletion
+therefore have a small intervening race; a route replaced with an indistinguishable
+identity cannot be attributed. The reported LAN-subnet deletion mechanism is avoided
+by using interface teardown instead of any explicit tunnel-subnet deletion. See
+[Apple's route deletion implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/net/route.c).
+The original cleanup had a definite destination-only deletion bug; that establishes
+a plausible mechanism, not proof that WGApp removed any particular historical route.
+
+After building, verify the helper that normal app connections actually execute:
+
+```sh
+bash scripts/check-installed-helper.sh
+```
+
+This prints file metadata and SHA-256 hashes for `/usr/local/libexec/wgapp-root` and
+the bundled build, and fails if they differ. Building alone does not update the
+installed helper. Disconnect before `./b install`; an already-running supervisor
+continues executing its old code until it exits. The updated app refuses new
+connections unless the installed helper advertises `routeCleanupVersion: 1`.
+
+Run the unprivileged route-regression suite:
+
+```sh
+bash scripts/verify-route-cleanup.sh
+```
+
+It covers exact/broader/narrower LAN overlaps, partial startup rollback, normal
+disconnect, unexpected utun loss, replacement Wi-Fi routes, interface index reuse,
+changed gateways/ownership flags/scope, failed route operations, IPv4/IPv6, legacy
+destination-only records, teardown failures and repeated DNS-failure cleanup.
+It asserts that pre-tunnel routes remain intact. These are simulated routing-table
+tests; they do not toggle Wi-Fi or change DNS.
+
+For native output parsing without network changes, run
+`build/verify-route-cleanup --read-only`. For isolated live helper tests, disconnect
+WGApp, build, authorize sudo in Terminal, then run:
+
+```sh
+sudo -v
+python3 scripts/verify-route-cleanup-live.py
+```
+
+The live script prints installed/built helper hashes and tests the **built helper**
+directly with synthetic keys and reserved test routes. It checks LAN-conflict
+rollback, normal/repeated disconnect, preservation of an existing endpoint route,
+and unexpected tunnel exit followed by a replacement interface route. It removes
+its fixtures, does not install a helper, and does not modify DNS or toggle Wi-Fi.
+Actual Wi-Fi roaming and real DNS-restoration failures still need a controlled
+manual check after installation; compare the LAN route before connection and after
+disconnect/roaming, and confirm HTTP access to a LAN service.
+
+Route add/reuse/conflict/delete/skip/teardown events are recorded in macOS unified
+logging without request JSON, keys, credentials or command output:
+
+```sh
+log show --last 15m --style compact --predicate 'subsystem == "com.example.wgapp.root-helper" AND category == "routes"'
+```
+
 ## Set up Fly.io
 
 Install the deployment tools if needed and log in:

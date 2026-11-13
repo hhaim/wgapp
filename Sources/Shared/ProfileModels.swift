@@ -91,6 +91,17 @@ struct SupervisorState: Codable {
     var physicalFamily: EndpointFamily? = nil
     var physicalInterface: String? = nil
     var physicalGateway: String? = nil
+    // Older supervisors only have destination strings, which are not ownership evidence.
+    var managedRoutes: [ManagedRoute]? = nil
+    var interfaceIndex: UInt32? = nil
+    var interfaceCleanupComplete: Bool? = nil
+}
+
+struct ManagedRoute: Codable, Equatable {
+    var destination: String
+    var interface: String
+    var interfaceIndex: UInt32
+    var gateway: String?
 }
 
 struct RootUpResult: Codable {
@@ -117,6 +128,7 @@ struct RootStatusResult: Codable {
     var sentBytes: UInt64
     var mtu: Int?
     var launcherVersion: Int? = 3
+    var routeCleanupVersion: Int? = 1
 }
 
 enum ProfileValidationError: LocalizedError {

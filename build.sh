@@ -35,7 +35,7 @@ fi
 /usr/bin/codesign --verify --strict "$HELPER_CACHE/WGProfileHelper"
 cp "$HELPER_CACHE/WGProfileHelper" "$APP_STAGE/Contents/Helpers/WGProfileHelper"
 "$SWIFT_COMPILER" "${COMMON_ARGS[@]}" -module-name WGRootHelper \
-  Sources/Shared/AppConstants.swift Sources/Shared/ProfileModels.swift Sources/Shared/GOSTConfiguration.swift Sources/WGRootHelper/main.swift \
+  Sources/Shared/AppConstants.swift Sources/Shared/ProfileModels.swift Sources/Shared/GOSTConfiguration.swift Sources/WGRootHelper/*.swift \
   -o "$APP_STAGE/Contents/Helpers/WGRootHelper"
 "$SWIFT_COMPILER" -swift-version 5 -parse-as-library -module-name WGApp \
   -target "$BUILD_ARCH-apple-macosx14.0" -sdk "$MACOS_SDK" \

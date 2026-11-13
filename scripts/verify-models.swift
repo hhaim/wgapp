@@ -42,10 +42,12 @@ struct VerifyModels {
         let oldStatus = Data(#"{"active":false,"latestHandshake":0,"receivedBytes":0,"sentBytes":0}"#.utf8)
         let old = try JSONDecoder().decode(RootStatusResult.self, from: oldStatus)
         precondition(old.launcherVersion == nil)
+        precondition(old.routeCleanupVersion == nil)
         let current = RootStatusResult(active: false, interfaceName: nil, endpoint: nil, latestHandshake: 0,
                                        receivedBytes: 0, sentBytes: 0, mtu: nil)
         let roundTrip = try JSONDecoder().decode(RootStatusResult.self, from: JSONEncoder().encode(current))
         precondition(roundTrip.launcherVersion == 3)
+        precondition(roundTrip.routeCleanupVersion == 1)
         print("PASS old root helpers cannot advertise proxy capability; current helpers can")
     }
 }

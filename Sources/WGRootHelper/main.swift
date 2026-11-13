@@ -189,7 +189,7 @@ struct TransportPlan {
     var physicalInterface: String
     var physicalFamily: EndpointFamily
     var mtu: Int
-    var addedRoutes: [String]
+    var addedRoutes: [ManagedRoute]
     var proxyProcess: Process?
 }
 
@@ -217,12 +217,12 @@ func prepareTransport(_ request: RootUpRequest) throws -> TransportPlan {
     guard let proxy = request.proxy else {
         let route = try routeInfo(family: request.endpointFamily)
         let address = try resolve(request.endpointHost, family: request.endpointFamily)
-        let added = try addEndpointRoute(address: address, gateway: route.gateway, physicalInterface: route.interface)
+        let added = try RouteManager().add(address, interface: route.interface, gateway: route.gateway)
         return TransportPlan(address: address, port: request.endpointPort,
                              display: endpointText(address: request.endpointHost, port: request.endpointPort),
                              gateway: route.gateway, physicalInterface: route.interface,
                              physicalFamily: request.endpointFamily, mtu: route.mtu - request.endpointFamily.directOverhead,
-                             addedRoutes: added ? [address] : [], proxyProcess: nil)
+                             addedRoutes: added.map { [$0] } ?? [], proxyProcess: nil)
     }
     try ProfileValidator.validateProxy(proxy)
     let executable = "/usr/local/libexec/wgapp-gost"
@@ -241,20 +241,20 @@ func prepareTransport(_ request: RootUpRequest) throws -> TransportPlan {
         candidates += addresses.map { ($0, route.gateway, route.interface, family) }
     }
     guard !candidates.isEmpty else { throw RootError.message("The proxy domain could not be resolved through a physical network.") }
-    var addedRoutes: [String] = []
+    var addedRoutes: [ManagedRoute] = []
     var process: Process?
     var ready = false
     defer {
         if !ready {
             if let process, process.isRunning { process.terminate(); process.waitUntilExit() }
-            for route in addedRoutes { deleteRoute(route) }
+            _ = RouteManager().cleanup(&addedRoutes)
         }
     }
     // Protect every resolved address before changing routes or DNS. The client is
     // pinned to one reachable address, while SNI/Host retain the real TLS name.
     for candidate in candidates {
-        if try addEndpointRoute(address: candidate.address, gateway: candidate.gateway, physicalInterface: candidate.interface) {
-            addedRoutes.append(candidate.address)
+        if let route = try RouteManager().add(candidate.address, interface: candidate.interface, gateway: candidate.gateway) {
+            addedRoutes.append(route)
         }
     }
     let reachable = candidates.first { candidate in
@@ -302,36 +302,6 @@ func prepareTransport(_ request: RootUpRequest) throws -> TransportPlan {
 
 func endpointText(address: String, port: UInt16) -> String {
     address.contains(":") ? "[\(address)]:\(port)" : "\(address):\(port)"
-}
-
-func networkFamily(_ cidr: String) -> String { cidr.contains(":") ? "-inet6" : "-inet" }
-
-func routedInterface(for address: String) -> String? {
-    let result = try? run("/sbin/route", ["-n", "get", networkFamily(address), address], requireSuccess: false)
-    guard result?.status == 0 else { return nil }
-    for line in result?.output.split(separator: "\n") ?? [] {
-        let parts = line.split(separator: ":", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
-        if parts.count == 2, parts[0] == "interface" { return parts[1] }
-    }
-    return nil
-}
-
-func addEndpointRoute(address: String, gateway: String, physicalInterface: String) throws -> Bool {
-    let result = try run("/sbin/route", ["-q", "-n", "add", networkFamily(address), address, "-gateway", gateway],
-                         requireSuccess: false)
-    if result.status == 0 { return true }
-    guard routedInterface(for: address) == physicalInterface else {
-        throw RootError.message("Could not protect the WireGuard endpoint with a route through \(physicalInterface).")
-    }
-    return false
-}
-
-func deleteRoute(_ cidr: String) {
-    _ = try? run("/sbin/route", ["-q", "-n", "delete", networkFamily(cidr), cidr], requireSuccess: false)
-}
-
-func addTunnelRoute(_ cidr: String, interface: String) throws {
-    try run("/sbin/route", ["-q", "-n", "add", networkFamily(cidr), cidr, "-interface", interface])
 }
 
 func configureAddress(_ address: String, interface: String) throws {
@@ -386,18 +356,44 @@ func interfaceForLogicalName(_ logicalName: String) -> String? {
     return value
 }
 
-func removeInterface(logicalName: String, interfaceName: String) {
-    try? FileManager.default.removeItem(atPath: "/var/run/wireguard/\(interfaceName).sock")
+@discardableResult
+func removeInterface(logicalName: String, interfaceName: String, expectedIndex: UInt32?) -> Bool {
+    guard interfaceForLogicalName(logicalName) == interfaceName else {
+        routeLog("skip interface teardown; logical interface mapping changed")
+        return true
+    }
+    if let expectedIndex, if_nametoindex(interfaceName) == expectedIndex {
+        let socket = "/var/run/wireguard/\(interfaceName).sock"
+        if FileManager.default.fileExists(atPath: socket) {
+            do { try FileManager.default.removeItem(atPath: socket) }
+            catch {
+                routeLog("defer teardown interface=\(interfaceName); socket removal failed")
+                return false
+            }
+        }
+        routeLog("teardown interface=\(interfaceName) index=\(expectedIndex)")
+    } else {
+        routeLog("skip teardown interface=\(interfaceName); interface absent or ownership unavailable/changed")
+    }
     try? FileManager.default.removeItem(atPath: nameFile(logicalName))
+    return true
 }
 
-func cleanup(_ state: SupervisorState) -> Bool {
-    for route in state.routes { deleteRoute(route) }
-    removeInterface(logicalName: state.logicalName, interfaceName: state.interfaceName)
-    if state.endpointRouteAdded { deleteRoute(state.endpointAddress) }
+func cleanup(_ state: inout SupervisorState, routeManager: RouteManager = RouteManager(),
+             teardown: (String, String, UInt32?) -> Bool = { removeInterface(logicalName: $0, interfaceName: $1, expectedIndex: $2) },
+             restoreDNSState: ([DNSServiceState]) -> Bool = restoreDNS) -> Bool {
+    var routes = state.managedRoutes ?? []
+    if state.managedRoutes == nil {
+        routeLog("skip legacy route records; destination-only state is not ownership evidence")
+    }
+    let routesCleaned = routeManager.cleanup(&routes)
+    state.managedRoutes = routes
+    if state.interfaceCleanupComplete != true {
+        state.interfaceCleanupComplete = teardown(state.logicalName, state.interfaceName, state.interfaceIndex)
+    }
     if let proxyPID = state.proxyPID, isProxyProcess(proxyPID) { kill(proxyPID, SIGTERM) }
-    for route in state.transportRoutes ?? [] { deleteRoute(route) }
-    guard restoreDNS(state.dnsBaseline) else { return false }
+    let dnsRestored = restoreDNSState(state.dnsBaseline)
+    guard routesCleaned, dnsRestored, state.interfaceCleanupComplete == true else { return false }
     try? FileManager.default.removeItem(atPath: pidFile(state.logicalName))
     return true
 }
@@ -448,18 +444,19 @@ func startTunnel() throws -> RootUpResult {
     guard request.persistentKeepalive == 25 else { throw RootError.message("PersistentKeepalive must be 25 seconds.") }
     try rejectAnotherTunnel(except: request.logicalName)
 
-    let transport = try prepareTransport(request)
+    var transport = try prepareTransport(request)
     let mtu = transport.mtu
     var interfaceName: String?
-    var addedRoutes: [String] = []
+    var interfaceIndex: UInt32?
+    var addedRoutes: [ManagedRoute] = []
     var dnsBaseline: [DNSServiceState] = []
     var supervisorStarted = false
     defer {
         if !supervisorStarted {
-            for route in addedRoutes { deleteRoute(route) }
-            if let interfaceName { removeInterface(logicalName: request.logicalName, interfaceName: interfaceName) }
+            _ = RouteManager().cleanup(&addedRoutes)
+            if let interfaceName { removeInterface(logicalName: request.logicalName, interfaceName: interfaceName, expectedIndex: interfaceIndex) }
             if let process = transport.proxyProcess, process.isRunning { process.terminate(); process.waitUntilExit() }
-            for route in transport.addedRoutes { deleteRoute(route) }
+            _ = RouteManager().cleanup(&transport.addedRoutes)
             _ = restoreDNS(dnsBaseline)
         }
     }
@@ -472,6 +469,7 @@ func startTunnel() throws -> RootUpResult {
         throw RootError.message("wireguard-go did not report its utun interface.")
     }
     interfaceName = createdInterface
+    interfaceIndex = if_nametoindex(createdInterface)
 
     var configuration = "[Interface]\nPrivateKey = \(request.privateKey)\n\n[Peer]\nPublicKey = \(request.peerPublicKey)\n"
     if let presharedKey = request.presharedKey, !presharedKey.isEmpty {
@@ -495,8 +493,9 @@ func startTunnel() throws -> RootUpResult {
     for allowedIP in request.allowedIPs.sorted(by: {
         Int($0.split(separator: "/").last ?? "0") ?? 0 > Int($1.split(separator: "/").last ?? "0") ?? 0
     }) {
-        try addTunnelRoute(allowedIP, interface: createdInterface)
-        addedRoutes.append(allowedIP)
+        if let route = try RouteManager().add(allowedIP, interface: createdInterface) {
+            addedRoutes.append(route)
+        }
     }
     if let dns = request.dns {
         dnsBaseline = try captureDNSBaseline()
@@ -505,11 +504,11 @@ func startTunnel() throws -> RootUpResult {
 
     let state = SupervisorState(logicalName: request.logicalName, interfaceName: createdInterface,
                                 endpointAddress: transport.address, endpointRouteAdded: false,
-                                routes: addedRoutes, dnsBaseline: dnsBaseline,
-                                transportRoutes: transport.addedRoutes,
+                                routes: [], dnsBaseline: dnsBaseline,
                                 proxyPID: transport.proxyProcess?.processIdentifier,
-                                physicalFamily: request.proxy == nil ? nil : transport.physicalFamily,
-                                physicalInterface: transport.physicalInterface, physicalGateway: transport.gateway)
+                                physicalFamily: transport.physicalFamily,
+                                physicalInterface: transport.physicalInterface, physicalGateway: transport.gateway,
+                                managedRoutes: addedRoutes + transport.addedRoutes, interfaceIndex: interfaceIndex)
     try launchSupervisor(state)
     supervisorStarted = true
     return RootUpResult(logicalName: request.logicalName, interfaceName: createdInterface,
@@ -532,8 +531,8 @@ func stopTunnel() throws {
         throw RootError.message("Cleanup did not finish within ten seconds.")
     }
     if let interface = interfaceForLogicalName(request.logicalName) {
-        removeInterface(logicalName: request.logicalName, interfaceName: interface)
-        throw RootError.message("Recovered an orphaned interface, but its in-memory DNS baseline was unavailable.")
+        routeLog("orphan interface=\(interface); no in-memory ownership or DNS baseline available")
+        throw RootError.message("Found an orphaned interface (\(interface)); its ownership and DNS baseline are unavailable. Restart the Mac before reconnecting.")
     }
 }
 
@@ -570,7 +569,7 @@ func tunnelStatus() throws -> RootStatusResult {
 }
 
 func supervise() throws -> Never {
-    let state = try readStdin(SupervisorState.self)
+    var state = try readStdin(SupervisorState.self)
     try validateLogicalName(state.logicalName)
     try ensureRuntimeDirectories()
     try Data("\(getpid())\n".utf8).write(to: URL(fileURLWithPath: pidFile(state.logicalName)), options: .atomic)
@@ -584,7 +583,7 @@ func supervise() throws -> Never {
     var stopping = false
     let attemptCleanup = {
         stopping = true
-        if cleanup(state) { exit(0) }
+        if cleanup(&state) { exit(0) }
     }
     term.setEventHandler(handler: attemptCleanup)
     interrupt.setEventHandler(handler: attemptCleanup)
@@ -606,6 +605,7 @@ func supervise() throws -> Never {
     dispatchMain()
 }
 
+#if !ROUTE_TESTS
 @main
 struct WGRootHelper {
     static func main() {
@@ -626,3 +626,4 @@ struct WGRootHelper {
         }
     }
 }
+#endif
