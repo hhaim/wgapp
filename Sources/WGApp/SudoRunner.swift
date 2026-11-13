@@ -106,22 +106,44 @@ enum RootLauncherClient {
 
     static func up(_ request: RootUpRequest) async throws -> RootUpResult {
         try requireInstalled()
-        let capabilities = try await status(logicalName: request.logicalName)
+        return try await up(request, execute: { try await invoke($0, input: $1) })
+    }
+
+    static func up(_ request: RootUpRequest,
+                   execute: (String, Data) async throws -> Data) async throws -> RootUpResult {
+        let name = try JSONEncoder().encode(RootNameRequest(logicalName: request.logicalName))
+        let capabilities = try JSONDecoder().decode(RootStatusResult.self, from: await execute("status", name))
         guard capabilities.routeCleanupVersion == 1 else {
-            throw AppError.message("The installed root helper needs the route cleanup fix. Disconnect, then run ./b install to update it.")
+            throw AppError.message("The installed root helper needs the route cleanup fix. Run ./b install to update it. If an old tunnel is still active, restart the Mac before reconnecting.")
         }
         if request.proxy != nil {
             guard capabilities.launcherVersion == 3 else {
                 throw AppError.message("The installed root helper does not support GOST proxy mode. Run ./b install to update it.")
             }
         }
-        let data = try await invoke("up", input: try JSONEncoder().encode(request))
-        return try JSONDecoder().decode(RootUpResult.self, from: data)
+        let data = try await execute("up", JSONEncoder().encode(request))
+        do {
+            return try JSONDecoder().decode(RootUpResult.self, from: data)
+        } catch {
+            // Up succeeded, so recover its session if the response is unreadable.
+            // The root helper already rolls back unsuccessful up commands itself.
+            _ = try? await execute("down", name)
+            throw error
+        }
     }
 
     static func down(logicalName: String) async throws {
         try requireInstalled()
-        _ = try await invoke("down", input: try JSONEncoder().encode(RootNameRequest(logicalName: logicalName)))
+        try await down(logicalName: logicalName, execute: { try await invoke($0, input: $1) })
+    }
+
+    static func down(logicalName: String, execute: (String, Data) async throws -> Data) async throws {
+        let name = try JSONEncoder().encode(RootNameRequest(logicalName: logicalName))
+        let capabilities = try JSONDecoder().decode(RootStatusResult.self, from: await execute("status", name))
+        guard capabilities.routeCleanupVersion == 1 else {
+            throw AppError.message("Disconnect is blocked because the installed root helper has unsafe route cleanup. Run ./b install to update it. If an old tunnel is still active, restart the Mac before reconnecting.")
+        }
+        _ = try await execute("down", name)
     }
 
     static func status(logicalName: String) async throws -> RootStatusResult {

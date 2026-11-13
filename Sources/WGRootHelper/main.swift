@@ -17,6 +17,16 @@ struct CommandResult {
 
 let runtimeDirectory = "/var/run/wgapp"
 
+struct SupervisorRecord: Codable {
+    var pid: Int32
+    var routeCleanupVersion: Int = 1
+}
+
+func supervisorAllowsCleanup(_ data: Data, pid: Int32) -> Bool {
+    guard let record = try? JSONDecoder().decode(SupervisorRecord.self, from: data) else { return false }
+    return record.pid == pid && record.routeCleanupVersion == 1
+}
+
 func tool(_ name: String) throws -> String {
     for directory in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"] {
         let path = directory + "/" + name
@@ -100,8 +110,9 @@ func ensureRuntimeDirectories() throws {
 }
 
 func liveSupervisorPID(for logicalName: String) -> pid_t? {
-    guard let text = try? String(contentsOfFile: pidFile(logicalName), encoding: .utf8),
-          let value = Int32(text.trimmingCharacters(in: .whitespacesAndNewlines)), value > 1,
+    guard let data = try? Data(contentsOf: URL(fileURLWithPath: pidFile(logicalName))) else { return nil }
+    let record = try? JSONDecoder().decode(SupervisorRecord.self, from: data)
+    guard let value = record?.pid ?? Int32(String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)), value > 1,
           kill(value, 0) == 0 else { return nil }
     let command = (try? run("/bin/ps", ["-p", String(value), "-o", "command="], requireSuccess: false).output) ?? ""
     guard command.hasSuffix("wgapp-root supervise") || command.hasSuffix("WGRootHelper supervise") else { return nil }
@@ -522,6 +533,11 @@ func stopTunnel() throws {
     let request = try readStdin(RootNameRequest.self)
     try validateLogicalName(request.logicalName)
     if let pid = liveSupervisorPID(for: request.logicalName) {
+        guard let record = try? Data(contentsOf: URL(fileURLWithPath: pidFile(request.logicalName))),
+              supervisorAllowsCleanup(record, pid: pid) else {
+            routeLog("blocked disconnect supervisor=\(pid); legacy cleanup would be unsafe")
+            throw RootError.message("The running tunnel supervisor predates safe route cleanup. Restart the Mac before reconnecting; updating the helper does not replace that running process.")
+        }
         guard kill(pid, SIGTERM) == 0 else { throw RootError.message("Could not signal the cleanup supervisor.") }
         let deadline = Date().addingTimeInterval(10)
         while Date() < deadline {
@@ -572,7 +588,8 @@ func supervise() throws -> Never {
     var state = try readStdin(SupervisorState.self)
     try validateLogicalName(state.logicalName)
     try ensureRuntimeDirectories()
-    try Data("\(getpid())\n".utf8).write(to: URL(fileURLWithPath: pidFile(state.logicalName)), options: .atomic)
+    try JSONEncoder().encode(SupervisorRecord(pid: getpid()))
+        .write(to: URL(fileURLWithPath: pidFile(state.logicalName)), options: .atomic)
     try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: pidFile(state.logicalName))
     signal(SIGTERM, SIG_IGN)
     signal(SIGINT, SIG_IGN)

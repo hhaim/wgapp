@@ -94,9 +94,9 @@ final class ProfileStore: ObservableObject {
     private var savedProfileNames = Set<String>()
     private var unsavedProfiles: [String: ProfileEditor] = [:]
 
-    init() {
+    init(recoverProfiles: Bool = true) {
         monitor = Monitor { [weak self] in self?.monitorTick() }
-        Task { await reloadProfilesAndRecover() }
+        if recoverProfiles { Task { await reloadProfilesAndRecover() } }
     }
 
     var activeCount: Int { activeTunnel == nil ? 0 : 1 }
@@ -209,7 +209,9 @@ final class ProfileStore: ObservableObject {
         }
     }
 
-    func connect(_ profile: WGProfile, options: ConnectionOptions) {
+    func connect(_ profile: WGProfile, options: ConnectionOptions,
+                 launch: @escaping (RootUpRequest) async throws -> RootUpResult = { try await RootLauncherClient.up($0) },
+                 cleanup: @escaping (String) async throws -> Void = { try await RootLauncherClient.down(logicalName: $0) }) {
         guard !networkBusy, activeTunnel == nil else { return }
         pendingConnection = nil
         networkBusy = true
@@ -219,7 +221,6 @@ final class ProfileStore: ObservableObject {
             do {
                 try ProfileValidator.validate(profile)
                 let logicalName = ManagedInterfaceName.forProfile(profile.name)
-                attemptedLogicalName = logicalName
                 let host = options.family == .ipv4 ? profile.endpointIPv4 : profile.endpointIPv6
                 if options.useProxy && profile.proxy == nil {
                     throw AppError.message("Edit this profile and configure its Fly.io proxy first.")
@@ -237,7 +238,10 @@ final class ProfileStore: ObservableObject {
                     endpointFamily: options.family,
                     persistentKeepalive: 25,
                     proxy: options.useProxy ? profile.proxy : nil)
-                let result = try await RootLauncherClient.up(request)
+                let result = try await launch(request)
+                // A rejected preflight never started a tunnel and must not call
+                // down on the installed helper (which may still be an old build).
+                attemptedLogicalName = logicalName
                 activeTunnel = TunnelRuntime(
                     profileName: profile.name, logicalName: logicalName,
                     interfaceName: result.interfaceName, phase: .connecting,
@@ -251,7 +255,7 @@ final class ProfileStore: ObservableObject {
                 previousStats = nil
                 try await awaitHandshake(logicalName: logicalName)
             } catch {
-                if let logicalName = attemptedLogicalName { try? await RootLauncherClient.down(logicalName: logicalName) }
+                if let logicalName = attemptedLogicalName { try? await cleanup(logicalName) }
                 activeTunnel = nil
                 lastError = error.localizedDescription
             }

@@ -99,7 +99,10 @@ def main():
     address = run(['/usr/sbin/ipconfig', 'getifaddr', physical]).stdout.decode().strip()
     mask = run(['/usr/sbin/ipconfig', 'getoption', physical, 'subnet_mask']).stdout.decode().strip()
     lan = str(ipaddress.ip_network(address + '/' + mask, strict=False))
-    baseline = identity(exact(lan))
+    lan_route = exact(lan)
+    if lan_route is None:
+        raise RuntimeError('Restore the physical LAN route before testing its preservation')
+    baseline = identity(lan_route)
     wg = next(path for path in [Path('/opt/homebrew/bin/wg'), Path('/usr/local/bin/wg')] if path.is_file())
     private = run([wg, 'genkey']).stdout.strip()
     public = run([wg, 'pubkey'], private + b'\n').stdout.decode().strip()
@@ -114,14 +117,17 @@ def main():
     replacement_created = False
     preserved_endpoint_created = False
     try:
-        # The exact physical-LAN conflict must leave the baseline untouched.
+        # An exact LAN overlap must allow startup while keeping the old route.
         collision = dict(request, allowedIPs=[TUNNEL, lan])
-        result = invoke('up', collision, check=False)
-        assert result.returncode != 0, 'LAN collision was accepted'
-        wait_for(lambda: exact(TUNNEL) is None, 'partial-start route release')
+        result = json.loads(invoke('up', collision).stdout)
+        assert exact(TUNNEL)['interface'] == result['interfaceName']
+        assert identity(exact(lan)) == baseline
+        down()
+        down()
+        wait_for(lambda: exact(TUNNEL) is None, 'overlap disconnect route release')
         assert identity(exact(lan)) == baseline
         assert exact(ENDPOINT) is None
-        print('PASS live overlapping LAN conflict and partial-start rollback preserve baseline', flush=True)
+        print('PASS live overlapping LAN allows tunnel startup and preserves baseline after repeated disconnect', flush=True)
         # A normal up/down removes only synthetic owned routes; a second down is harmless.
         invoke('up', request)
         assert exact(TUNNEL)['interface'].startswith('utun')

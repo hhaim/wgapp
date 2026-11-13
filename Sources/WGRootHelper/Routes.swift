@@ -120,6 +120,10 @@ final class RouteManager {
         let index = interfaceIndex(interface)
         guard index != 0 else { throw RootError.message("Route interface is no longer available.") }
         if let existing = try lookup(network) {
+            if gateway == nil {
+                log("skip-add destination=\(network.cidr) interface=\(existing.interface); existing route retained, tunnel continues")
+                return nil
+            }
             if gateway != nil, existing.interface == interface,
                !existing.flags.contains("REJECT"), !existing.flags.contains("BLACKHOLE") {
                 log("reuse destination=\(network.cidr) interface=\(interface); existing route retained")
@@ -133,6 +137,10 @@ final class RouteManager {
         let result = try execute(["-q", "-n", "add", network.familyFlag] + network.routeArguments + target + ["-proto1", "-proto2"])
         log("add destination=\(network.cidr) interface=\(interface) index=\(index) gateway=\(gateway ?? "direct") status=\(result.status)")
         guard result.status == 0 else {
+            if gateway == nil, let existing = try lookup(network) {
+                log("skip-add destination=\(network.cidr) interface=\(existing.interface); route appeared during setup, tunnel continues")
+                return nil
+            }
             throw RootError.message("Could not add route for \(network.cidr); existing routes were left unchanged.")
         }
         return route

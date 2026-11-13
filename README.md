@@ -68,8 +68,12 @@ Disconnect restores DNS and removes the interface, routes and helper processes. 
 
 WGApp checks routes before adding them. Existing routes never enter its cleanup list,
 including pre-existing endpoint routes with the same protocol flags as WGApp's routes.
-An exact AllowedIPs conflict (for example, the Wi-Fi LAN and tunnel both requesting
-`10.0.0.0/24`) fails connection and leaves the existing route intact. Broader or
+An exact AllowedIPs overlap (for example, the Wi-Fi LAN and tunnel both requesting
+`10.0.0.0/24`) skips that tunnel route and lets the tunnel start with the existing
+route intact. Traffic for that prefix keeps using the existing route; other
+AllowedIPs routes are installed normally. The skipped route never becomes owned
+by cleanup. Conflicting endpoint/relay bypass routes still fail setup if they do
+not use the physical interface needed to reach the server. Broader or
 narrower tunnel prefixes can coexist with the LAN route. WGApp only adds routes;
 it does not change or replace pre-existing routes, so no displaced route needs
 restoration. Restoring a saved Wi-Fi route after the network changes could install
@@ -102,22 +106,29 @@ bash scripts/check-installed-helper.sh
 
 This prints file metadata and SHA-256 hashes for `/usr/local/libexec/wgapp-root` and
 the bundled build, and fails if they differ. Building alone does not update the
-installed helper. Disconnect before `./b install`; an already-running supervisor
-continues executing its old code until it exits. The updated app refuses new
-connections unless the installed helper advertises `routeCleanupVersion: 1`.
+installed helper, even when launching the local debug app. The updated app refuses
+both Connect and Disconnect unless the installed helper advertises
+`routeCleanupVersion: 1`. If an unsafe old tunnel is still active, restart the Mac
+instead of disconnecting through the old helper, then run `./b install`. An
+already-running supervisor continues executing its old code after installation;
+the updated helper refuses to signal a supervisor without a matching versioned
+PID record. Failed Connect preflight also leaves existing sessions alone.
 
 Run the unprivileged route-regression suite:
 
 ```sh
 bash scripts/verify-route-cleanup.sh
+bash scripts/verify-launcher-cleanup.sh
 ```
 
 It covers exact/broader/narrower LAN overlaps, partial startup rollback, normal
 disconnect, unexpected utun loss, replacement Wi-Fi routes, interface index reuse,
 changed gateways/ownership flags/scope, failed route operations, IPv4/IPv6, legacy
 destination-only records, teardown failures and repeated DNS-failure cleanup.
-It asserts that pre-tunnel routes remain intact. These are simulated routing-table
-tests; they do not toggle Wi-Fi or change DNS.
+It asserts that pre-tunnel routes remain intact. Launcher regressions exercise
+the actual app's Connect error handler and verify that stale-helper Disconnect
+and rejected Connect cannot issue an unsafe `down`. These use simulated routing
+tables and helper responses; they do not toggle Wi-Fi or change DNS.
 
 For native output parsing without network changes, run
 `build/verify-route-cleanup --read-only`. For isolated live helper tests, disconnect
@@ -129,8 +140,8 @@ python3 scripts/verify-route-cleanup-live.py
 ```
 
 The live script prints installed/built helper hashes and tests the **built helper**
-directly with synthetic keys and reserved test routes. It checks LAN-conflict
-rollback, normal/repeated disconnect, preservation of an existing endpoint route,
+directly with synthetic keys and reserved test routes. It checks successful startup
+with an overlapping LAN route, normal/repeated disconnect, preservation of an existing endpoint route,
 and unexpected tunnel exit followed by a replacement interface route. It removes
 its fixtures, does not install a helper, and does not modify DNS or toggle Wi-Fi.
 Actual Wi-Fi roaming and real DNS-restoration failures still need a controlled

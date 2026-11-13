@@ -35,6 +35,8 @@ final class FakeRoutes {
     var logs: [String] = []
     var failLookup = false
     var failDelete = false
+    var failAdd = false
+    var routeAppearingOnAdd: Entry?
     var mutations: [[String]] { commands.filter { $0.contains("add") || $0.contains("delete") } }
 
     func manager() -> RouteManager {
@@ -57,6 +59,11 @@ final class FakeRoutes {
             return CommandResult(output: try fallback.output(), status: 0)
         }
         if arguments.contains("add") {
+            if let entry = routeAppearingOnAdd {
+                entries[entry.destination] = entry
+                routeAppearingOnAdd = nil
+            }
+            if failAdd { return CommandResult(output: "temporary error", status: 1) }
             if entries[destination] != nil { return CommandResult(output: "File exists", status: 1) }
             let gateway = value("-gateway")
             var flags: Set<String> = ["UP", "STATIC", "PROTO1", "PROTO2"]
@@ -92,6 +99,15 @@ struct VerifyRouteCleanup {
     }
 
     static func main() throws {
+        do {
+            let record = try JSONEncoder().encode(SupervisorRecord(pid: 1234))
+            let future = try JSONEncoder().encode(SupervisorRecord(pid: 1234, routeCleanupVersion: 2))
+            precondition(supervisorAllowsCleanup(record, pid: 1234))
+            precondition(!supervisorAllowsCleanup(record, pid: 5678))
+            precondition(!supervisorAllowsCleanup(Data("1234\n".utf8), pid: 1234))
+            precondition(!supervisorAllowsCleanup(future, pid: 1234))
+        }
+        print("PASS legacy/unknown supervisors cannot be signalled for unsafe cleanup")
         // The old implementation deletes the replacement LAN route; demonstrate the regression trigger.
         do {
             let fake = FakeRoutes()
@@ -107,13 +123,36 @@ struct VerifyRouteCleanup {
             existing.flags = flags
             fake.entries[lan.destination] = existing
             let baseline = fake.entries
-            do {
-                _ = try fake.manager().add("10.0.0.24/24", interface: "utun42")
-                fatalError("Overlapping LAN route was accepted")
-            } catch is RootError { }
+            let skipped = try fake.manager().add("10.0.0.24/24", interface: "utun42")
+            precondition(skipped == nil)
             precondition(fake.entries == baseline && fake.mutations.isEmpty)
+            let added = try fake.manager().add("192.0.2.0/24", interface: "utun42")!
+            precondition(fake.entries[added.destination]?.interface == "utun42")
+            var session = state([added])
+            for dnsRestored in [false, false, true, true] {
+                _ = cleanup(&session, routeManager: fake.manager(), teardown: fake.teardown, restoreDNSState: { _ in dnsRestored })
+                precondition(fake.entries == baseline)
+            }
         }
-        print("PASS exact LAN/tunnel overlap and pre-existing tagged routes are preserved")
+        print("PASS exact LAN overlap allows other tunnel routes and preserves baseline through repeated cleanup")
+        do {
+            let fake = FakeRoutes()
+            let existing = FakeRoutes.Entry(destination: "2001:db8:1234::/64", interface: "en1")
+            fake.entries[existing.destination] = existing
+            let skipped = try fake.manager().add("2001:db8:1234::a/64", interface: "utun42")
+            precondition(skipped == nil && fake.entries[existing.destination] == existing && fake.mutations.isEmpty)
+        }
+        print("PASS exact IPv6 overlap retains the existing route without failing tunnel setup")
+        do {
+            let fake = FakeRoutes()
+            fake.routeAppearingOnAdd = lan
+            let skipped = try fake.manager().add(lan.destination, interface: "utun42")
+            precondition(skipped == nil && fake.entries[lan.destination] == lan)
+            var session = state([])
+            precondition(cleanup(&session, routeManager: fake.manager(), teardown: fake.teardown, restoreDNSState: { _ in true }))
+            precondition(fake.entries[lan.destination] == lan)
+        }
+        print("PASS route appearing during add is retained and never becomes cleanup-owned")
         // Broader and narrower tunnel prefixes coexist without changing the original LAN route.
         for subnet in ["10.0.0.0/8", "10.0.0.0/25"] {
             let fake = FakeRoutes()
@@ -133,9 +172,10 @@ struct VerifyRouteCleanup {
             let baseline = fake.entries
             let first = try fake.manager().add("192.0.2.0/24", interface: "utun42")!
             var pending = [first]
+            fake.failAdd = true
             do {
-                _ = try fake.manager().add(lan.destination, interface: "utun42")
-                fatalError("Collision was accepted")
+                _ = try fake.manager().add("198.18.42.0/24", interface: "utun42")
+                fatalError("Route operation failure was ignored")
             } catch is RootError { }
             precondition(fake.manager().cleanup(&pending))
             _ = fake.teardown("wga-0000000000", "utun42", 42)
@@ -205,6 +245,17 @@ struct VerifyRouteCleanup {
             precondition(fake.entries[existing.destination] == existing && fake.mutations.isEmpty)
         }
         print("PASS existing physical endpoint route is reused without becoming cleanup-owned")
+        do {
+            let fake = FakeRoutes()
+            let existing = FakeRoutes.Entry(destination: "\(endpoint)/32", interface: "en1")
+            fake.entries[existing.destination] = existing
+            do {
+                _ = try fake.manager().add(endpoint, interface: "en0", gateway: "10.0.0.138")
+                fatalError("Conflicting endpoint bypass was accepted")
+            } catch is RootError { }
+            precondition(fake.entries[existing.destination] == existing && fake.mutations.isEmpty)
+        }
+        print("PASS endpoint bypass still rejects a conflicting interface without modifying its route")
         do {
             let fake = FakeRoutes()
             let bypass = try fake.manager().add(endpoint, interface: "en0", gateway: "10.0.0.138")!
